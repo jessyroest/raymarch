@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Raymarch</title>
+<meta name="description" content="A real-time 3D scene rendered by a single fragment shader. No meshes, no libraries.">
+<style>
+  html, body { margin: 0; height: 100%; background: #07070b; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  .hud { position: fixed; left: 16px; bottom: 16px; right: 16px; display: flex; justify-content: space-between; align-items: flex-end;
+    gap: 12px; flex-wrap: wrap; pointer-events: none;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: rgba(255,255,255,.72);
+    text-shadow: 0 1px 8px rgba(0,0,0,.6); }
+  .hud b { color: #fff; font-weight: 600; }
+  .hud a { color: rgba(255,255,255,.72); pointer-events: auto; }
+  .tag { pointer-events: auto; }
+  button { pointer-events: auto; font: inherit; color: #fff; background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.18);
+    border-radius: 999px; padding: 5px 12px; cursor: pointer; backdrop-filter: blur(6px); }
+  button:hover { background: rgba(255,255,255,.16); }
+  .err { position: fixed; inset: 0; display: none; place-items: center; color: #fff; font: 14px system-ui, sans-serif; padding: 24px; text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud">
+  <div class="tag"><b>Raymarch</b> · one fragment shader, no meshes, no libraries<br>
+    drag to orbit · scroll to zoom · <span id="fps"></span> · <a href="https://github.com/jessyroest/raymarch">source</a></div>
+  <div><button id="mood">Change mood</button></div>
+</div>
+<div class="err" id="err">This demo needs WebGL, which your browser doesn't seem to support.</div>
+
+<script id="frag" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec3  uCam;      // yaw, pitch, distance
+uniform float uMood;     // 0..1 blend between two looks
+uniform float uMood2;
+
+// ---------- distance field helpers ----------
+float smin(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+float sdTorus(vec3 p, vec2 t) { vec2 q = vec2(length(p.xz) - t.x, p.y); return length(q) - t.y; }
+
+// The sculpture: blobs that orbit and melt into each other, wrapped in a twisting ring.
+float blob(vec3 p) {
+  float t = uTime * 0.6;
+  float d = length(p - vec3(0.0, 1.15 + 0.12 * sin(t * 1.3), 0.0)) - 0.62;
+  for (int i = 0; i < 5; i++) {
+    float fi = float(i);
+    vec3 c = vec3(sin(t * (0.7 + 0.13 * fi) + fi * 1.7) * 0.95,
+                  1.15 + cos(t * (0.9 + 0.11 * fi) + fi * 2.3) * 0.55,
+                  cos(t * (0.6 + 0.17 * fi) + fi * 0.9) * 0.95);
+    d = smin(d, length(p - c) - (0.22 + 0.05 * fi), 0.45);
+  }
+  vec3 q = p - vec3(0.0, 1.15, 0.0);
+  q.xy *= rot(0.5 * sin(t * 0.5));
+  q.yz *= rot(t * 0.35);
+  float ring = sdTorus(q, vec2(1.55, 0.06 + 0.02 * sin(atan(q.z, q.x) * 6.0 + t * 3.0)));
+  return smin(d, ring, 0.25);
+}
+
+// returns (distance, material): 1 = sculpture, 2 = floor
+vec2 map(vec3 p) {
+  float b = blob(p);
+  float f = p.y;
+  return b < f ? vec2(b, 1.0) : vec2(f, 2.0);
+}
+
+vec3 normal(vec3 p) {
+  const vec2 e = vec2(0.0015, 0.0);
+  return normalize(vec3(map(p + e.xyy).x - map(p - e.xyy).x,
+                        map(p + e.yxy).x - map(p - e.yxy).x,
+                        map(p + e.yyx).x - map(p - e.yyx).x));
+}
+
+vec2 march(vec3 ro, vec3 rd, float maxT) {
+  float t = 0.0;
+  for (int i = 0; i < 110; i++) {
+    vec2 h = map(ro + rd * t);
+    if (h.x < 0.0008 * t) return vec2(t, h.y);
+    t += h.x;
+    if (t > maxT) break;
+  }
+  return vec2(-1.0, 0.0);
+}
+
+float softShadow(vec3 ro, vec3 rd) {
+  float res = 1.0, t = 0.03;
+  for (int i = 0; i < 40; i++) {
+    float h = map(ro + rd * t).x;
+    res = min(res, 10.0 * h / t);
+    t += clamp(h, 0.02, 0.25);
+    if (res < 0.002 || t > 8.0) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+float ao(vec3 p, vec3 n) {
+  float occ = 0.0, s = 1.0;
+  for (int i = 1; i <= 5; i++) {
+    float h = 0.03 + 0.12 * float(i);
+    occ += (h - map(p + n * h).x) * s;
+    s *= 0.75;
+  }
+  return clamp(1.0 - 1.6 * occ, 0.0, 1.0);
+}
+
+// ---------- look ----------
+vec3 palette(float k) {
+  // two moods to switch between: dusk and neon
+  vec3 a = mix(vec3(1.00, 0.45, 0.18), vec3(0.10, 0.95, 0.90), uMood);
+  vec3 b = mix(vec3(0.45, 0.12, 0.70), vec3(0.95, 0.10, 0.70), uMood);
+  return mix(a, b, k);
+}
+vec3 sunDir() { return normalize(mix(vec3(-0.6, 0.45, -0.5), vec3(0.5, 0.7, -0.4), uMood2)); }
+
+vec3 sky(vec3 rd) {
+  vec3 top = mix(vec3(0.04, 0.05, 0.14), vec3(0.01, 0.01, 0.04), uMood);
+  vec3 hor = mix(vec3(0.55, 0.20, 0.14), vec3(0.20, 0.06, 0.38), uMood);
+  vec3 col = mix(hor, top, pow(clamp(rd.y, 0.0, 1.0), 0.45));
+  float s = max(dot(rd, sunDir()), 0.0);
+  col += mix(vec3(1.0, 0.7, 0.4), vec3(0.6, 0.4, 1.0), uMood) * (pow(s, 400.0) * 3.0 + pow(s, 8.0) * 0.25);
+  return col;
+}
+
+vec3 shade(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 hitN, out float hitMat, out float fres) {
+  vec2 h = march(ro, rd, 40.0);
+  hitMat = 0.0; fres = 0.0;
+  if (h.x < 0.0) return sky(rd);
+  vec3 p = ro + rd * h.x;
+  vec3 n = normal(p);
+  hitPos = p; hitN = n; hitMat = h.y;
+  vec3 L = sunDir();
+  float dif = clamp(dot(n, L), 0.0, 1.0) * softShadow(p + n * 0.01, L);
+  float occ = ao(p, n);
+  float sky_ = 0.5 + 0.5 * n.y;
+  fres = pow(1.0 - clamp(dot(n, -rd), 0.0, 1.0), 4.0);
+  vec3 alb;
+  if (h.y < 1.5) {
+    float k = 0.5 + 0.5 * sin(p.y * 3.0 + p.x * 1.5 - uTime * 0.8);
+    alb = palette(k);
+  } else {
+    float grid = smoothstep(0.465, 0.495, abs(fract(p.x) - 0.5)) + smoothstep(0.465, 0.495, abs(fract(p.z) - 0.5));
+    alb = vec3(0.05) + 0.35 * clamp(grid, 0.0, 1.0) * palette(0.3);
+  }
+  vec3 sunCol = mix(vec3(1.4, 1.05, 0.8), vec3(0.9, 0.8, 1.5), uMood);
+  vec3 col = alb * (dif * sunCol + sky_ * occ * mix(vec3(0.35, 0.25, 0.35), vec3(0.15, 0.12, 0.3), uMood));
+  vec3 hlf = normalize(L - rd);
+  col += sunCol * pow(clamp(dot(n, hlf), 0.0, 1.0), 60.0) * dif * (h.y < 1.5 ? 1.0 : 0.3);
+  // glow where the sculpture nearly touches the floor
+  if (h.y > 1.5) col += palette(0.5) * 0.35 * exp(-3.0 * blob(p));
+  float fog = 1.0 - exp(-0.0006 * h.x * h.x);
+  return mix(col, sky(rd), fog);
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+  float yaw = uCam.x, pitch = uCam.y, dist = uCam.z;
+  vec3 target = vec3(0.0, 1.0, 0.0);
+  vec3 ro = target + dist * vec3(cos(pitch) * sin(yaw), sin(pitch), cos(pitch) * cos(yaw));
+  vec3 fw = normalize(target - ro);
+  vec3 rt = normalize(cross(fw, vec3(0.0, 1.0, 0.0)));
+  vec3 up = cross(rt, fw);
+  vec3 rd = normalize(uv.x * rt + uv.y * up + 1.6 * fw);
+
+  vec3 p, n; float mat, fres;
+  vec3 col = shade(ro, rd, p, n, mat, fres);
+
+  // one reflection bounce: glossy sculpture, mirror-ish floor
+  if (mat > 0.0) {
+    vec3 rr = reflect(rd, n);
+    vec3 p2, n2; float m2, f2;
+    vec3 refl = shade(p + n * 0.02, rr, p2, n2, m2, f2);
+    float k = mat < 1.5 ? 0.15 + 0.6 * fres : 0.12 + 0.45 * fres;
+    col = mix(col, refl, k);
+  }
+
+  col = col / (1.0 + col);                         // tone map
+  col = pow(col, vec3(0.4545));                    // gamma
+  col *= 1.0 - 0.35 * dot(uv * 0.9, uv * 0.9);     // vignette
+  col += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0; // dither
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+'use strict';
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: false, powerPreference: 'high-performance' });
+if (!gl) { document.getElementById('err').style.display = 'grid'; throw new Error('no webgl'); }
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, 'attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }'));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('frag').textContent));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, 'p');
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const U = n => gl.getUniformLocation(prog, n);
+const uRes = U('uRes'), uTime = U('uTime'), uCam = U('uCam'), uMood = U('uMood'), uMood2 = U('uMood2');
+
+// ---------- adaptive resolution: keep it smooth on slow GPUs ----------
+let scale = Math.min(window.devicePixelRatio || 1, 1.5) * 0.75;
+function resize() {
+  canvas.width = Math.max(1, Math.round(innerWidth * scale));
+  canvas.height = Math.max(1, Math.round(innerHeight * scale));
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+addEventListener('resize', resize);
+resize();
+
+// ---------- camera ----------
+const cam = { yaw: 0.6, pitch: 0.28, dist: 5.2 };
+const goal = { ...cam };
+let dragging = false, lastX = 0, lastY = 0, idle = 0;
+canvas.addEventListener('pointerdown', e => { dragging = true; lastX = e.clientX; lastY = e.clientY; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  goal.yaw -= (e.clientX - lastX) * 0.006;
+  goal.pitch = Math.min(1.35, Math.max(0.05, goal.pitch + (e.clientY - lastY) * 0.004));
+  lastX = e.clientX; lastY = e.clientY; idle = 0;
+});
+addEventListener('pointerup', () => dragging = false);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  goal.dist = Math.min(12, Math.max(2.6, goal.dist * Math.exp(e.deltaY * 0.001)));
+  idle = 0;
+}, { passive: false });
+
+// ---------- moods ----------
+let mood = 0, moodGoal = 0, mood2 = 0, mood2Goal = 0;
+document.getElementById('mood').onclick = () => { moodGoal = 1 - moodGoal; mood2Goal = 1 - mood2Goal; };
+
+// ---------- loop ----------
+const fpsEl = document.getElementById('fps');
+let prev = performance.now(), acc = 0, frames = 0, t0 = prev;
+function frame(now) {
+  const dt = Math.min(0.05, (now - prev) / 1000);
+  prev = now;
+  idle += dt;
+  if (!dragging && idle > 2) goal.yaw += dt * 0.12;     // slow auto-orbit when you're not touching it
+  const k = 1 - Math.exp(-dt * 6);
+  cam.yaw += (goal.yaw - cam.yaw) * k;
+  cam.pitch += (goal.pitch - cam.pitch) * k;
+  cam.dist += (goal.dist - cam.dist) * k;
+  const km = 1 - Math.exp(-dt * 2);
+  mood += (moodGoal - mood) * km;
+  mood2 += (mood2Goal - mood2) * km;
+
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, (now - t0) / 1000);
+  gl.uniform3f(uCam, cam.yaw, cam.pitch, cam.dist);
+  gl.uniform1f(uMood, mood);
+  gl.uniform1f(uMood2, mood2);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  frames++; acc += dt;
+  if (acc > 1) {
+    const fps = frames / acc;
+    fpsEl.textContent = `${Math.round(fps)} fps · ${canvas.width}×${canvas.height}`;
+    // nudge resolution up or down to stay around 50+ fps
+    if (fps < 40 && scale > 0.35) { scale *= 0.85; resize(); }
+    else if (fps > 58 && scale < Math.min(devicePixelRatio || 1, 1.5)) { scale = Math.min(scale * 1.08, Math.min(devicePixelRatio || 1, 1.5)); resize(); }
+    frames = 0; acc = 0;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
